@@ -1,56 +1,58 @@
-cat ~/.bin/gitai/gitai
 #!/bin/bash
 
-# فایل: ~/.bin/gitai
+# gitai - Generate Conventional Commit messages using AI, without temp files
+
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 API_BASE="https://api.avalapis.ir/v1/chat/completions"
-# MODEL="gpt-4o-mini"
 MODEL="gpt-4.i-nano"
 MAX_DIFF_LENGTH=12000
 
+# Load config if present
 if [ -f "$SCRIPT_DIR/.gitai" ]; then
   source "$SCRIPT_DIR/.gitai"
 fi
 
-API_KEY=${GITAI_API_KEY}
+API_KEY=${GITAI_API_KEY:-}
 
 if [ -z "$API_KEY" ]; then
-  echo "Error: GITAI_API_KEY not found."
-  echo "Please set GITAI_API_KEY in $SCRIPT_DIR/.gitai or as an environment variable."
+  echo "Error: GITAI_API_KEY not found. Set it in $SCRIPT_DIR/.gitai or as an environment variable." >&2
   exit 1
 fi
 
-# نمایش وضعیت گیت
 echo
 echo "==== Git Status ===="
 git status
 echo "===================="
 echo
 
-# سوال: میخوای همه فایل‌ها رو stage کنم؟
-read -p "Stage all changes (git add -A)? (y/n): " ADD_CONFIRM
-
-if [[ "$ADD_CONFIRM" =~ ^[Yy]$ ]]; then
-  git add -A
-  echo "All changes staged."
-else
-  echo "Continuing without adding files."
+if [[ -n "$(git status --porcelain)" ]]; then
+  read -p "Stage all changes (git add -A)? (y/n): " ADD_CONFIRM
+  if [[ "$ADD_CONFIRM" =~ ^[Yy]$ ]]; then
+    git add -A
+    echo "All changes staged."
+  else
+    echo "Continuing without adding files."
+  fi
 fi
 
-# گرفتن تغییرات استیج شده
-GIT_DIFF=$(git diff --cached)
+# Check for staged changes only
+GIT_DIFF=$(git diff --cached --no-ext-diff)
 
 if [ -z "$GIT_DIFF" ]; then
   echo "No staged changes found. Stage your changes first."
   exit 1
 fi
 
-TRIMMED_DIFF="$GIT_DIFF"
-DIFF_LENGTH=${#GIT_DIFF}
+if [[ $(git diff --name-only) ]]; then
+  echo "⚠️  Warning: You have unstaged changes that will NOT be included in this commit."
+fi
 
+DIFF_LENGTH=${#GIT_DIFF}
+TRIMMED_DIFF="$GIT_DIFF"
 if [ "$DIFF_LENGTH" -gt "$MAX_DIFF_LENGTH" ]; then
-  echo "⚠️ Diff is too long ($DIFF_LENGTH characters). Trimming to first $MAX_DIFF_LENGTH characters."
+  echo "⚠️  Diff is too long ($DIFF_LENGTH characters). Trimming to $MAX_DIFF_LENGTH characters."
   TRIMMED_DIFF="${GIT_DIFF:0:$MAX_DIFF_LENGTH}"
 fi
 
@@ -81,17 +83,15 @@ JSON_PAYLOAD=$(jq -n \
     temperature: 0.4
   }')
 
-RESPONSE=$(curl -s "$API_BASE" \
+RESPONSE=$(curl -sfL "$API_BASE" \
   -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
-  -d "$JSON_PAYLOAD")
+  -d "$JSON_PAYLOAD") || { echo "API request failed."; exit 2; }
 
-# echo -e "\n📥 Raw Response:\n$RAW_RESPONSE\n"
+COMMIT_MESSAGE=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty')
 
-COMMIT_MESSAGE=$(echo "$RESPONSE" | jq -r '.choices[0].message.content')
-
-if [ "$COMMIT_MESSAGE" == "null" ]; then
-  echo "Error from OpenAI:"
+if [ -z "$COMMIT_MESSAGE" ]; then
+  echo "API response error:"
   echo "$RESPONSE"
   exit 1
 fi
@@ -105,11 +105,10 @@ echo
 read -p "Use this commit message? (y/n): " CONFIRM
 
 if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
-  TITLE=$(echo "$COMMIT_MESSAGE" | grep -i '^Title:' | sed 's/Title: //')
-  DESCRIPTION=$(echo "$COMMIT_MESSAGE" | grep -i '^Description:' | sed 's/Description: //')
+  TITLE=$(echo "$COMMIT_MESSAGE" | grep -i '^Title:' | sed 's/^[Tt]itle:[[:space:]]*//')
+  DESCRIPTION=$(echo "$COMMIT_MESSAGE" | grep -i '^Description:' | sed 's/^[Dd]escription:[[:space:]]*//')
   
   git commit -m "$TITLE" -m "$DESCRIPTION"
-  
   echo
   read -p "Push to remote? (y/n): " PUSH_CONFIRM
   if [[ "$PUSH_CONFIRM" =~ ^[Yy]$ ]]; then
@@ -119,4 +118,4 @@ if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
   fi
 else
   echo "Commit canceled."
-fi%                                                                                
+fi
