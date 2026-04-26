@@ -5,21 +5,197 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-API_BASE="https://api.avalapis.ir/v1/chat/completions"
-MODEL="gpt-4.i-nano"
-MAX_DIFF_LENGTH=12000
-
 # Load config if present
 if [ -f "$SCRIPT_DIR/.gitai" ]; then
   source "$SCRIPT_DIR/.gitai"
 fi
 
-API_KEY=${GITAI_API_KEY:-}
+PROVIDER_CHAIN_RAW="${GITAI_PROVIDER:-avalapis}"
+MAX_DIFF_LENGTH="${GITAI_MAX_DIFF_LENGTH:-12000}"
+DEFAULT_API_KEY="${GITAI_API_KEY:-}"
 
-if [ -z "$API_KEY" ]; then
-  echo "Error: GITAI_API_KEY not found. Set it in $SCRIPT_DIR/.gitai or as an environment variable." >&2
+if ! [[ "$MAX_DIFF_LENGTH" =~ ^[0-9]+$ ]]; then
+  echo "Error: GITAI_MAX_DIFF_LENGTH must be a positive integer." >&2
   exit 1
 fi
+
+trim_value() {
+  local value="$1"
+  # shellcheck disable=SC2001
+  echo "$value" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
+build_chat_prompt() {
+  local diff_content="$1"
+
+  cat <<PROMPT
+You are a Git expert AI assistant. Given the following git diff, generate a structured commit message following the Conventional Commits format.
+
+Your output must be in this format:
+
+Title: <type>(<scope>): <short summary>
+Description: <detailed explanation of what and why, in plain English>
+
+- Use one of these types: feat, fix, docs, chore, refactor, test, build, ci, style
+- The scope is optional, but if identifiable, use the folder or feature name (e.g., auth, api, ui)
+- Keep the title under 72 characters
+- Write the description in full sentences and include reasoning if possible
+
+Git diff:
+$diff_content
+PROMPT
+}
+
+resolve_provider_api_key() {
+  local provider="$1"
+
+  case "$provider" in
+    avalapis)
+      echo "${GITAI_AVALAPIS_API_KEY:-$DEFAULT_API_KEY}"
+      ;;
+    openrouter)
+      echo "${GITAI_OPENROUTER_API_KEY:-$DEFAULT_API_KEY}"
+      ;;
+    cloudflare)
+      echo "${GITAI_CLOUDFLARE_API_KEY:-$DEFAULT_API_KEY}"
+      ;;
+    google)
+      echo "${GITAI_GOOGLE_API_KEY:-$DEFAULT_API_KEY}"
+      ;;
+    *)
+      echo ""
+      ;;
+  esac
+}
+
+set_provider_defaults() {
+  local provider="$1"
+
+  case "$provider" in
+    avalapis)
+      ATTEMPT_API_BASE="${GITAI_API_BASE:-https://api.avalapis.ir/v1/chat/completions}"
+      ATTEMPT_MODEL="${GITAI_AVALAPIS_MODEL:-${GITAI_MODEL:-gpt-4.i-nano}}"
+      ;;
+    openrouter)
+      ATTEMPT_API_BASE="${GITAI_API_BASE:-https://openrouter.ai/api/v1/chat/completions}"
+      ATTEMPT_MODEL="${GITAI_OPENROUTER_MODEL:-${GITAI_MODEL:-openai/gpt-4o-mini}}"
+      ;;
+    cloudflare)
+      ATTEMPT_API_BASE="${GITAI_API_BASE:-https://api.cloudflare.com/client/v4/accounts/${GITAI_CLOUDFLARE_ACCOUNT_ID:-}/ai/v1/chat/completions}"
+      ATTEMPT_MODEL="${GITAI_CLOUDFLARE_MODEL:-${GITAI_MODEL:-@cf/meta/llama-3.3-70b-instruct-fp8-fast}}"
+      ;;
+    google)
+      ATTEMPT_MODEL="${GITAI_GOOGLE_MODEL:-${GITAI_MODEL:-gemini-2.0-flash}}"
+      ATTEMPT_API_BASE="${GITAI_API_BASE:-https://generativelanguage.googleapis.com/v1beta/models/${ATTEMPT_MODEL}:generateContent}"
+      ;;
+    *)
+      LAST_ERROR="Unsupported provider '$provider'. Supported: avalapis, openrouter, cloudflare, google"
+      return 1
+      ;;
+  esac
+
+  return 0
+}
+
+call_chat_completions_api() {
+  local provider="$1"
+  local prompt="$2"
+  local api_key="$3"
+
+  JSON_PAYLOAD=$(jq -n \
+    --arg model "$ATTEMPT_MODEL" \
+    --arg user "$prompt" \
+    '{
+      model: $model,
+      messages: [
+        {role: "user", content: $user}
+      ],
+      temperature: 0.4
+    }')
+
+  local -a headers
+  headers=(-H "Content-Type: application/json" -H "Authorization: Bearer $api_key")
+
+  if [ "$provider" = "openrouter" ]; then
+    headers+=(-H "HTTP-Referer: https://github.com" -H "X-Title: GitAI")
+  fi
+
+  RESPONSE=$(curl -sfL "$ATTEMPT_API_BASE" "${headers[@]}" -d "$JSON_PAYLOAD" 2>&1) || {
+    LAST_ERROR="API request failed: $RESPONSE"
+    return 1
+  }
+
+  COMMIT_MESSAGE=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty')
+  if [ -z "$COMMIT_MESSAGE" ]; then
+    LAST_ERROR="Empty/invalid response from provider '$provider'"
+    return 1
+  fi
+
+  return 0
+}
+
+call_google_api() {
+  local prompt="$1"
+  local api_key="$2"
+
+  JSON_PAYLOAD=$(jq -n \
+    --arg user "$prompt" \
+    '{
+      contents: [
+        {
+          role: "user",
+          parts: [
+            {text: $user}
+          ]
+        }
+      ],
+      generationConfig: {
+        temperature: 0.4
+      }
+    }')
+
+  RESPONSE=$(curl -sfL "$ATTEMPT_API_BASE?key=$api_key" \
+    -H "Content-Type: application/json" \
+    -d "$JSON_PAYLOAD" 2>&1) || {
+    LAST_ERROR="API request failed: $RESPONSE"
+    return 1
+  }
+
+  COMMIT_MESSAGE=$(echo "$RESPONSE" | jq -r '.candidates[0].content.parts[0].text // empty')
+  if [ -z "$COMMIT_MESSAGE" ]; then
+    LAST_ERROR="Empty/invalid response from provider 'google'"
+    return 1
+  fi
+
+  return 0
+}
+
+try_provider() {
+  local provider="$1"
+  local prompt="$2"
+
+  if ! set_provider_defaults "$provider"; then
+    return 1
+  fi
+
+  local provider_key
+  provider_key="$(resolve_provider_api_key "$provider")"
+  if [ -z "$provider_key" ]; then
+    LAST_ERROR="Missing API key for provider '$provider'."
+    return 1
+  fi
+
+  if [ "$provider" = "cloudflare" ] && [ -z "${GITAI_CLOUDFLARE_ACCOUNT_ID:-}" ] && [ -z "${GITAI_API_BASE:-}" ]; then
+    LAST_ERROR="Missing GITAI_CLOUDFLARE_ACCOUNT_ID for provider 'cloudflare'."
+    return 1
+  fi
+
+  if [ "$provider" = "google" ]; then
+    call_google_api "$prompt" "$provider_key"
+  else
+    call_chat_completions_api "$provider" "$prompt" "$provider_key"
+  fi
+}
 
 echo
 echo "==== Git Status ===="
@@ -56,45 +232,36 @@ if [ "$DIFF_LENGTH" -gt "$MAX_DIFF_LENGTH" ]; then
   TRIMMED_DIFF="${GIT_DIFF:0:$MAX_DIFF_LENGTH}"
 fi
 
-PROMPT="You are a Git expert AI assistant. Given the following git diff, generate a structured commit message following the Conventional Commits format.
+PROMPT=$(build_chat_prompt "$TRIMMED_DIFF")
 
-Your output must be in this format:
+IFS=',' read -r -a PROVIDER_CHAIN <<< "$PROVIDER_CHAIN_RAW"
+COMMIT_MESSAGE=""
+LAST_ERROR=""
+SUCCESS_PROVIDER=""
 
-Title: <type>(<scope>): <short summary>
-Description: <detailed explanation of what and why, in plain English>
+for raw_provider in "${PROVIDER_CHAIN[@]}"; do
+  provider="$(trim_value "$raw_provider")"
 
-- Use one of these types: feat, fix, docs, chore, refactor, test, build, ci, style
-- The scope is optional, but if identifiable, use the folder or feature name (e.g., auth, api, ui)
-- Keep the title under 72 characters
-- Write the description in full sentences and include reasoning if possible
+  if [ -z "$provider" ]; then
+    continue
+  fi
 
-Git diff:
-$TRIMMED_DIFF
-"
+  echo "Trying provider: $provider"
 
-JSON_PAYLOAD=$(jq -n \
-  --arg model "$MODEL" \
-  --arg user "$PROMPT" \
-  '{
-    model: $model,
-    messages: [
-      {role: "user", content: $user}
-    ],
-    temperature: 0.4
-  }')
+  if try_provider "$provider" "$PROMPT"; then
+    SUCCESS_PROVIDER="$provider"
+    break
+  fi
 
-RESPONSE=$(curl -sfL "$API_BASE" \
-  -H "Authorization: Bearer $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d "$JSON_PAYLOAD") || { echo "API request failed."; exit 2; }
+  echo "⚠️  Provider '$provider' failed: $LAST_ERROR"
+done
 
-COMMIT_MESSAGE=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty')
-
-if [ -z "$COMMIT_MESSAGE" ]; then
-  echo "API response error:"
-  echo "$RESPONSE"
-  exit 1
+if [ -z "$SUCCESS_PROVIDER" ]; then
+  echo "All configured providers failed. Last error: $LAST_ERROR" >&2
+  exit 2
 fi
+
+echo "✅ Provider succeeded: $SUCCESS_PROVIDER"
 
 echo
 echo "==== Suggested Commit Message ===="
@@ -107,7 +274,7 @@ read -p "Use this commit message? (y/n): " CONFIRM
 if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
   TITLE=$(echo "$COMMIT_MESSAGE" | grep -i '^Title:' | sed 's/^[Tt]itle:[[:space:]]*//')
   DESCRIPTION=$(echo "$COMMIT_MESSAGE" | grep -i '^Description:' | sed 's/^[Dd]escription:[[:space:]]*//')
-  
+
   git commit -m "$TITLE" -m "$DESCRIPTION"
   echo
   read -p "Push to remote? (y/n): " PUSH_CONFIRM
