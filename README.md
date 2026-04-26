@@ -5,6 +5,7 @@
 ## Features
 
 - Works with your existing Git workflow.
+- Supports multiple providers: AvalAI, OpenRouter, Cloudflare Workers AI, and Google AI Studio (Gemini API).
 - Warns about unstaged changes before committing.
 - Trims very large diffs to avoid sending excessively long requests.
 - Interactive prompts let you review and accept the generated message.
@@ -30,17 +31,62 @@ cp gitai /usr/local/bin/
 
 ## Configuration
 
-GitAI expects an API key for the backend that generates the commit messages. You can provide it in two ways:
+GitAI needs API credentials. You can either use a shared key (`GITAI_API_KEY`) or provider-specific keys, and you can set them as environment variables or in a `.gitai` file next to the script.
 
-1. Set the environment variable `GITAI_API_KEY`.
-2. Create a file named `.gitai` next to the script that exports the variable. For example:
+Example `.gitai` file:
 
 ```bash
-# .gitai
-export GITAI_API_KEY="your-api-key"
+export GITAI_PROVIDER="google,openrouter,cloudflare,avalapis"
+export GITAI_GOOGLE_API_KEY="your-google-key"
+export GITAI_OPENROUTER_API_KEY="your-openrouter-key"
+export GITAI_CLOUDFLARE_API_KEY="your-cloudflare-key"
+export GITAI_AVALAPIS_API_KEY="your-avalapis-key"
+export GITAI_CLOUDFLARE_ACCOUNT_ID="your-cloudflare-account-id"
 ```
 
-The script also allows overriding the API endpoint and model by modifying the variables at the top of the script.
+### Provider options
+
+Set `GITAI_PROVIDER` to one provider **or a comma-separated fallback chain**:
+
+- `avalapis` (default)
+- `openrouter`
+- `cloudflare`
+- `google`
+
+Examples:
+
+- `GITAI_PROVIDER="google,openrouter,cloudflare,avalapis"`
+- `GITAI_PROVIDER="openrouter"`
+
+Additional provider-specific variables:
+
+- `openrouter`
+  - Optional: `GITAI_MODEL` (default `openai/gpt-4o-mini`)
+- `cloudflare`
+  - Required unless `GITAI_API_BASE` is set: `GITAI_CLOUDFLARE_ACCOUNT_ID`
+  - Optional: `GITAI_MODEL` (default `@cf/meta/llama-3.3-70b-instruct-fp8-fast`)
+- `google`
+  - Optional: `GITAI_MODEL` (default `gemini-2.0-flash`)
+
+Global optional variables:
+
+- `GITAI_API_BASE`: Override endpoint URL (advanced use)
+- `GITAI_MAX_DIFF_LENGTH`: Max diff chars sent to model (default `12000`)
+- `GITAI_MODEL`: Shared default model override
+
+Per-provider API keys (recommended for fallback chains):
+
+- `GITAI_AVALAPIS_API_KEY`
+- `GITAI_OPENROUTER_API_KEY`
+- `GITAI_CLOUDFLARE_API_KEY`
+- `GITAI_GOOGLE_API_KEY`
+
+Per-provider model overrides (optional):
+
+- `GITAI_AVALAPIS_MODEL`
+- `GITAI_OPENROUTER_MODEL`
+- `GITAI_CLOUDFLARE_MODEL`
+- `GITAI_GOOGLE_MODEL`
 
 ## Usage
 
@@ -51,7 +97,7 @@ git add file.txt
 ./gitai
 ```
 
-GitAI will print the git status, send your diff to the API and show the suggested commit message. You can then choose whether to commit and optionally push.
+GitAI will print git status, send your diff to the configured provider, and show the suggested commit message. You can then choose whether to commit and optionally push.
 
 A complete example is available in [`examples/basic_usage.sh`](examples/basic_usage.sh).
 
