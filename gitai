@@ -6,6 +6,8 @@ set -euo pipefail
 
 VERSION="0.2.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+USER_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/gitai/config"
+LEGACY_HOME_CONFIG="$HOME/.bin/gitai/.gitai"
 
 fail() {
   printf 'gitai: %s\n' "$*" >&2
@@ -23,26 +25,32 @@ done
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || fail "Run gitai inside a Git repository."
 GIT_ROOT="$(git rev-parse --show-toplevel)"
 
-# Configuration precedence (later files win): legacy install-local, user, repository.
-# Keeping the legacy location preserves compatibility with older installations.
-if [ -f "$SCRIPT_DIR/.gitai" ]; then
-  # shellcheck disable=SC1091
-  source "$SCRIPT_DIR/.gitai"
-fi
-if [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/gitai/config" ]; then
+# Configuration precedence (later files win):
+# 1. install-local legacy config
+# 2. historical ~/.bin/gitai/.gitai config
+# 3. XDG user config
+# 4. repository config
+source_config() {
+  local file="$1"
+  [ -f "$file" ] || return 0
+  # Config files intentionally contain shell-style export statements.
   # shellcheck disable=SC1090
-  source "${XDG_CONFIG_HOME:-$HOME/.config}/gitai/config"
+  source "$file"
+}
+
+source_config "$SCRIPT_DIR/.gitai"
+if [ "$LEGACY_HOME_CONFIG" != "$SCRIPT_DIR/.gitai" ]; then
+  source_config "$LEGACY_HOME_CONFIG"
 fi
-if [ -f "$GIT_ROOT/.gitai" ]; then
-  # shellcheck disable=SC1090
-  source "$GIT_ROOT/.gitai"
-fi
+source_config "$USER_CONFIG"
+source_config "$GIT_ROOT/.gitai"
 
 PROVIDER_CHAIN_RAW="${GITAI_PROVIDER:-avalapis}"
 MAX_DIFF_LENGTH="${GITAI_MAX_DIFF_LENGTH:-12000}"
 DEFAULT_API_KEY="${GITAI_API_KEY:-}"
 TUI_ENABLED="${GITAI_TUI:-1}"
 AUTO_PUSH_MODE=""
+FORCE_SETUP=0
 
 if ! [[ "$MAX_DIFF_LENGTH" =~ ^[0-9]+$ ]] || [ "$MAX_DIFF_LENGTH" -eq 0 ]; then
   fail "GITAI_MAX_DIFF_LENGTH must be a positive integer."
@@ -128,9 +136,141 @@ ui_choose() {
   done
 }
 
+ui_secret() {
+  local prompt="$1"
+  local value
+  if use_gum; then
+    gum input --password --prompt "$prompt: "
+  else
+    read -r -s -p "$prompt: " value
+    printf '\n' >&2
+    printf '%s' "$value"
+  fi
+}
+
+ui_input() {
+  local prompt="$1"
+  local value
+  if use_gum; then
+    gum input --prompt "$prompt: "
+  else
+    read -r -p "$prompt: " value
+    printf '%s' "$value"
+  fi
+}
+
 trim_value() {
   local value="$1"
   printf '%s' "$value" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
+resolve_provider_api_key() {
+  local provider="$1"
+
+  case "$provider" in
+    avalapis) printf '%s' "${GITAI_AVALAPIS_API_KEY:-$DEFAULT_API_KEY}" ;;
+    openrouter) printf '%s' "${GITAI_OPENROUTER_API_KEY:-$DEFAULT_API_KEY}" ;;
+    cloudflare) printf '%s' "${GITAI_CLOUDFLARE_API_KEY:-$DEFAULT_API_KEY}" ;;
+    google) printf '%s' "${GITAI_GOOGLE_API_KEY:-$DEFAULT_API_KEY}" ;;
+    *) printf '' ;;
+  esac
+}
+
+configured_provider_has_key() {
+  local raw_provider provider
+  local providers=()
+  IFS=',' read -r -a providers <<< "$PROVIDER_CHAIN_RAW"
+  for raw_provider in "${providers[@]}"; do
+    provider="$(trim_value "$raw_provider")"
+    [ -n "$provider" ] || continue
+    if [ -n "$(resolve_provider_api_key "$provider")" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+write_user_config() {
+  local provider="$1"
+  local key="$2"
+  local account_id="${3:-}"
+  local key_var
+
+  case "$provider" in
+    avalapis) key_var="GITAI_AVALAPIS_API_KEY" ;;
+    openrouter) key_var="GITAI_OPENROUTER_API_KEY" ;;
+    cloudflare) key_var="GITAI_CLOUDFLARE_API_KEY" ;;
+    google) key_var="GITAI_GOOGLE_API_KEY" ;;
+    *) fail "Unsupported provider: $provider" ;;
+  esac
+
+  mkdir -p "$(dirname "$USER_CONFIG")"
+  umask 077
+
+  # Replace GitAI-owned provider/key lines while preserving unrelated settings.
+  local tmp
+  tmp="$(mktemp)"
+  if [ -f "$USER_CONFIG" ]; then
+    grep -Ev '^export GITAI_PROVIDER=|^export GITAI_(AVALAPIS|OPENROUTER|CLOUDFLARE|GOOGLE)_API_KEY=|^export GITAI_CLOUDFLARE_ACCOUNT_ID=' "$USER_CONFIG" > "$tmp" || true
+  fi
+
+  {
+    cat "$tmp"
+    printf 'export GITAI_PROVIDER=%q\n' "$provider"
+    printf 'export %s=%q\n' "$key_var" "$key"
+    if [ "$provider" = "cloudflare" ] && [ -n "$account_id" ]; then
+      printf 'export GITAI_CLOUDFLARE_ACCOUNT_ID=%q\n' "$account_id"
+    fi
+  } > "$USER_CONFIG"
+  rm -f "$tmp"
+  chmod 600 "$USER_CONFIG"
+}
+
+setup_credentials() {
+  is_interactive || fail "No API key found. Configure $USER_CONFIG or $LEGACY_HOME_CONFIG, or run gitai --setup in an interactive terminal."
+
+  ui_header "GitAI setup"
+  ui_note "No API key was found for the configured provider."
+  ui_note "Credentials will be stored in $USER_CONFIG with mode 600."
+
+  local selection provider key account_id=""
+  selection="$(ui_choose "Choose your AI provider" \
+    "Google AI Studio (Gemini)" \
+    "OpenRouter" \
+    "AvalAI / AvalAPIs" \
+    "Cloudflare Workers AI")"
+
+  case "$selection" in
+    "Google AI Studio (Gemini)") provider="google" ;;
+    "OpenRouter") provider="openrouter" ;;
+    "AvalAI / AvalAPIs") provider="avalapis" ;;
+    "Cloudflare Workers AI") provider="cloudflare" ;;
+    *) fail "Setup canceled." ;;
+  esac
+
+  key="$(ui_secret "API key")"
+  [ -n "$key" ] || fail "API key cannot be empty."
+
+  if [ "$provider" = "cloudflare" ]; then
+    account_id="$(ui_input "Cloudflare account ID")"
+    [ -n "$account_id" ] || fail "Cloudflare account ID cannot be empty."
+  fi
+
+  write_user_config "$provider" "$key" "$account_id"
+
+  export GITAI_PROVIDER="$provider"
+  PROVIDER_CHAIN_RAW="$provider"
+  case "$provider" in
+    avalapis) export GITAI_AVALAPIS_API_KEY="$key" ;;
+    openrouter) export GITAI_OPENROUTER_API_KEY="$key" ;;
+    cloudflare)
+      export GITAI_CLOUDFLARE_API_KEY="$key"
+      export GITAI_CLOUDFLARE_ACCOUNT_ID="$account_id"
+      ;;
+    google) export GITAI_GOOGLE_API_KEY="$key" ;;
+  esac
+  DEFAULT_API_KEY="${GITAI_API_KEY:-}"
+  ui_success "Configuration saved to $USER_CONFIG"
 }
 
 build_chat_prompt() {
@@ -153,18 +293,6 @@ Rules:
 Git diff:
 $diff_content
 PROMPT
-}
-
-resolve_provider_api_key() {
-  local provider="$1"
-
-  case "$provider" in
-    avalapis) printf '%s' "${GITAI_AVALAPIS_API_KEY:-$DEFAULT_API_KEY}" ;;
-    openrouter) printf '%s' "${GITAI_OPENROUTER_API_KEY:-$DEFAULT_API_KEY}" ;;
-    cloudflare) printf '%s' "${GITAI_CLOUDFLARE_API_KEY:-$DEFAULT_API_KEY}" ;;
-    google) printf '%s' "${GITAI_GOOGLE_API_KEY:-$DEFAULT_API_KEY}" ;;
-    *) printf '' ;;
-  esac
 }
 
 set_provider_defaults() {
@@ -280,6 +408,7 @@ Usage:
   gitai [options]
 
 Options:
+  --setup          Configure an AI provider and API key
   --push           Push after committing (asks for remote if needed)
   --push-all       Push the new commit to every configured remote
   --no-push        Never ask to push
@@ -287,9 +416,10 @@ Options:
   -v, --version    Show version
   -h, --help       Show this help
 
-Configuration:
-  ~/.config/gitai/config   User-wide config
-  <repo>/.gitai            Repository-specific config
+Configuration (later files override earlier files):
+  ~/.bin/gitai/.gitai       Legacy config used by older installations
+  ~/.config/gitai/config    User-wide config (or $XDG_CONFIG_HOME/gitai/config)
+  <repo>/.gitai             Repository-specific config
 
 Environment:
   GITAI_PROVIDER           Provider or fallback chain
@@ -300,6 +430,7 @@ HELP
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --setup) FORCE_SETUP=1 ;;
     --push) AUTO_PUSH_MODE="ask-remote" ;;
     --push-all) AUTO_PUSH_MODE="all" ;;
     --no-push) AUTO_PUSH_MODE="none" ;;
@@ -310,6 +441,15 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
+
+if [ "$FORCE_SETUP" -eq 1 ]; then
+  setup_credentials
+  exit 0
+fi
+
+if ! configured_provider_has_key; then
+  setup_credentials
+fi
 
 ui_header "GitAI · $(basename "$GIT_ROOT")"
 CURRENT_BRANCH="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
