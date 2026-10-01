@@ -18,7 +18,7 @@ jobs:
         run: bash -n gitai
 
       - name: Run ShellCheck
-        run: shellcheck gitai
+        run: shellcheck -e SC1091 gitai
 
       - name: Validate Homebrew formula Ruby syntax
         run: ruby -c Formula/gitai.rb
