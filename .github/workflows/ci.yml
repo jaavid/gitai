@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate Bash syntax
+        run: bash -n gitai
+
+      - name: Run ShellCheck
+        run: shellcheck -e SC1091 gitai
+
+      - name: Validate Homebrew formula Ruby syntax
+        run: ruby -c Formula/gitai.rb
+
+      - name: Verify executable bit and CLI version
+        run: |
+          test -x gitai
+          tmp="$(mktemp -d)"
+          git -C "$tmp" init
+          (cd "$tmp" && "$GITHUB_WORKSPACE/gitai" --version)

@@ -1,45 +1,154 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# gitai - Generate Conventional Commit messages using AI, without temp files
+# GitAI - AI-assisted Conventional Commits with a terminal-native workflow.
 
 set -euo pipefail
 
+VERSION="0.2.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Load config if present
+
+fail() {
+  printf 'gitai: %s\n' "$*" >&2
+  exit 1
+}
+
+command_exists() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+for dependency in git curl jq; do
+  command_exists "$dependency" || fail "Missing dependency: $dependency"
+done
+
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || fail "Run gitai inside a Git repository."
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+
+# Configuration precedence (later files win): legacy install-local, user, repository.
+# Keeping the legacy location preserves compatibility with older installations.
 if [ -f "$SCRIPT_DIR/.gitai" ]; then
+  # shellcheck disable=SC1091
   source "$SCRIPT_DIR/.gitai"
+fi
+if [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/gitai/config" ]; then
+  # shellcheck disable=SC1090
+  source "${XDG_CONFIG_HOME:-$HOME/.config}/gitai/config"
+fi
+if [ -f "$GIT_ROOT/.gitai" ]; then
+  # shellcheck disable=SC1090
+  source "$GIT_ROOT/.gitai"
 fi
 
 PROVIDER_CHAIN_RAW="${GITAI_PROVIDER:-avalapis}"
 MAX_DIFF_LENGTH="${GITAI_MAX_DIFF_LENGTH:-12000}"
 DEFAULT_API_KEY="${GITAI_API_KEY:-}"
+TUI_ENABLED="${GITAI_TUI:-1}"
+AUTO_PUSH_MODE=""
 
-if ! [[ "$MAX_DIFF_LENGTH" =~ ^[0-9]+$ ]]; then
-  echo "Error: GITAI_MAX_DIFF_LENGTH must be a positive integer." >&2
-  exit 1
+if ! [[ "$MAX_DIFF_LENGTH" =~ ^[0-9]+$ ]] || [ "$MAX_DIFF_LENGTH" -eq 0 ]; then
+  fail "GITAI_MAX_DIFF_LENGTH must be a positive integer."
 fi
+
+is_interactive() {
+  [ -t 0 ] && [ -t 1 ]
+}
+
+use_gum() {
+  [ "$TUI_ENABLED" != "0" ] && is_interactive && command_exists gum && [ "${TERM:-}" != "dumb" ]
+}
+
+ui_header() {
+  local text="$1"
+  if use_gum; then
+    gum style --bold --border rounded --padding "0 2" "$text"
+  else
+    printf '\n== %s ==\n' "$text"
+  fi
+}
+
+ui_note() {
+  local text="$1"
+  if use_gum; then
+    gum style --faint "$text"
+  else
+    printf '%s\n' "$text"
+  fi
+}
+
+ui_success() {
+  local text="$1"
+  if use_gum; then
+    gum style --bold "✓ $text"
+  else
+    printf '✓ %s\n' "$text"
+  fi
+}
+
+ui_warn() {
+  local text="$1"
+  if use_gum; then
+    gum style --bold "! $text"
+  else
+    printf '! %s\n' "$text"
+  fi
+}
+
+ui_confirm() {
+  local prompt="$1"
+  if use_gum; then
+    gum confirm "$prompt"
+  else
+    local answer
+    read -r -p "$prompt [y/N] " answer
+    [[ "$answer" =~ ^[Yy]$ ]]
+  fi
+}
+
+ui_choose() {
+  local prompt="$1"
+  shift
+
+  if use_gum; then
+    gum choose --header "$prompt" "$@"
+    return
+  fi
+
+  local options=("$@")
+  local i choice
+  printf '%s\n' "$prompt" >&2
+  for ((i = 0; i < ${#options[@]}; i++)); do
+    printf '  %d) %s\n' "$((i + 1))" "${options[$i]}" >&2
+  done
+  while true; do
+    read -r -p "> " choice
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#options[@]}" ]; then
+      printf '%s\n' "${options[$((choice - 1))]}"
+      return
+    fi
+    printf 'Choose a number between 1 and %d.\n' "${#options[@]}" >&2
+  done
+}
 
 trim_value() {
   local value="$1"
-  # shellcheck disable=SC2001
-  echo "$value" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+  printf '%s' "$value" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
 }
 
 build_chat_prompt() {
   local diff_content="$1"
 
   cat <<PROMPT
-You are a Git expert AI assistant. Given the following git diff, generate a structured commit message following the Conventional Commits format.
+You are a Git expert AI assistant. Given the following staged git diff, generate a structured commit message following Conventional Commits.
 
-Your output must be in this format:
-
+Output exactly these two lines:
 Title: <type>(<scope>): <short summary>
-Description: <detailed explanation of what and why, in plain English>
+Description: <clear explanation of what changed and why>
 
-- Use one of these types: feat, fix, docs, chore, refactor, test, build, ci, style
-- The scope is optional, but if identifiable, use the folder or feature name (e.g., auth, api, ui)
+Rules:
+- Allowed types: feat, fix, docs, chore, refactor, test, build, ci, style
+- Scope is optional; use a concise feature/folder scope when clear
 - Keep the title under 72 characters
-- Write the description in full sentences and include reasoning if possible
+- Do not use Markdown fences
+- Keep the description concise but informative
 
 Git diff:
 $diff_content
@@ -50,21 +159,11 @@ resolve_provider_api_key() {
   local provider="$1"
 
   case "$provider" in
-    avalapis)
-      echo "${GITAI_AVALAPIS_API_KEY:-$DEFAULT_API_KEY}"
-      ;;
-    openrouter)
-      echo "${GITAI_OPENROUTER_API_KEY:-$DEFAULT_API_KEY}"
-      ;;
-    cloudflare)
-      echo "${GITAI_CLOUDFLARE_API_KEY:-$DEFAULT_API_KEY}"
-      ;;
-    google)
-      echo "${GITAI_GOOGLE_API_KEY:-$DEFAULT_API_KEY}"
-      ;;
-    *)
-      echo ""
-      ;;
+    avalapis) printf '%s' "${GITAI_AVALAPIS_API_KEY:-$DEFAULT_API_KEY}" ;;
+    openrouter) printf '%s' "${GITAI_OPENROUTER_API_KEY:-$DEFAULT_API_KEY}" ;;
+    cloudflare) printf '%s' "${GITAI_CLOUDFLARE_API_KEY:-$DEFAULT_API_KEY}" ;;
+    google) printf '%s' "${GITAI_GOOGLE_API_KEY:-$DEFAULT_API_KEY}" ;;
+    *) printf '' ;;
   esac
 }
 
@@ -93,93 +192,69 @@ set_provider_defaults() {
       return 1
       ;;
   esac
-
-  return 0
 }
 
 call_chat_completions_api() {
   local provider="$1"
   local prompt="$2"
   local api_key="$3"
+  local response
 
   JSON_PAYLOAD=$(jq -n \
     --arg model "$ATTEMPT_MODEL" \
     --arg user "$prompt" \
-    '{
-      model: $model,
-      messages: [
-        {role: "user", content: $user}
-      ],
-      temperature: 0.4
-    }')
+    '{model: $model, messages: [{role: "user", content: $user}], temperature: 0.4}')
 
   local -a headers
   headers=(-H "Content-Type: application/json" -H "Authorization: Bearer $api_key")
 
   if [ "$provider" = "openrouter" ]; then
-    headers+=(-H "HTTP-Referer: https://github.com" -H "X-Title: GitAI")
+    headers+=(-H "HTTP-Referer: https://github.com/jaavid/gitai" -H "X-Title: GitAI")
   fi
 
-  RESPONSE=$(curl -sfL "$ATTEMPT_API_BASE" "${headers[@]}" -d "$JSON_PAYLOAD" 2>&1) || {
-    LAST_ERROR="API request failed: $RESPONSE"
+  if ! response=$(curl -sfL "$ATTEMPT_API_BASE" "${headers[@]}" -d "$JSON_PAYLOAD" 2>&1); then
+    LAST_ERROR="API request failed: $response"
     return 1
-  }
+  fi
 
-  COMMIT_MESSAGE=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty')
+  COMMIT_MESSAGE=$(printf '%s' "$response" | jq -r '.choices[0].message.content // empty')
   if [ -z "$COMMIT_MESSAGE" ]; then
     LAST_ERROR="Empty/invalid response from provider '$provider'"
     return 1
   fi
-
-  return 0
 }
 
 call_google_api() {
   local prompt="$1"
   local api_key="$2"
+  local response
 
   JSON_PAYLOAD=$(jq -n \
     --arg user "$prompt" \
-    '{
-      contents: [
-        {
-          role: "user",
-          parts: [
-            {text: $user}
-          ]
-        }
-      ],
-      generationConfig: {
-        temperature: 0.4
-      }
-    }')
+    '{contents: [{role: "user", parts: [{text: $user}]}], generationConfig: {temperature: 0.4}}')
 
-  RESPONSE=$(curl -sfL "$ATTEMPT_API_BASE?key=$api_key" \
+  if ! response=$(curl -sfL "$ATTEMPT_API_BASE?key=$api_key" \
     -H "Content-Type: application/json" \
-    -d "$JSON_PAYLOAD" 2>&1) || {
-    LAST_ERROR="API request failed: $RESPONSE"
+    -d "$JSON_PAYLOAD" 2>&1); then
+    LAST_ERROR="API request failed: $response"
     return 1
-  }
+  fi
 
-  COMMIT_MESSAGE=$(echo "$RESPONSE" | jq -r '.candidates[0].content.parts[0].text // empty')
+  COMMIT_MESSAGE=$(printf '%s' "$response" | jq -r '.candidates[0].content.parts[0].text // empty')
   if [ -z "$COMMIT_MESSAGE" ]; then
     LAST_ERROR="Empty/invalid response from provider 'google'"
     return 1
   fi
-
-  return 0
 }
 
 try_provider() {
   local provider="$1"
   local prompt="$2"
-
-  if ! set_provider_defaults "$provider"; then
-    return 1
-  fi
-
   local provider_key
+
+  set_provider_defaults "$provider" || return 1
   provider_key="$(resolve_provider_api_key "$provider")"
+
   if [ -z "$provider_key" ]; then
     LAST_ERROR="Missing API key for provider '$provider'."
     return 1
@@ -197,43 +272,92 @@ try_provider() {
   fi
 }
 
-echo
-echo "==== Git Status ===="
-git status
-echo "===================="
-echo
+show_help() {
+  cat <<'HELP'
+GitAI — AI-assisted Conventional Commits
 
-if [[ -n "$(git status --porcelain)" ]]; then
-  read -p "Stage all changes (git add -A)? (y/n): " ADD_CONFIRM
-  if [[ "$ADD_CONFIRM" =~ ^[Yy]$ ]]; then
-    git add -A
-    echo "All changes staged."
-  else
-    echo "Continuing without adding files."
-  fi
+Usage:
+  gitai [options]
+
+Options:
+  --push           Push after committing (asks for remote if needed)
+  --push-all       Push the new commit to every configured remote
+  --no-push        Never ask to push
+  --no-tui         Disable Gum UI and use plain terminal prompts
+  -v, --version    Show version
+  -h, --help       Show this help
+
+Configuration:
+  ~/.config/gitai/config   User-wide config
+  <repo>/.gitai            Repository-specific config
+
+Environment:
+  GITAI_PROVIDER           Provider or fallback chain
+  GITAI_TUI=0              Disable terminal UI
+  GITAI_MAX_DIFF_LENGTH    Maximum staged diff characters sent to AI
+HELP
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --push) AUTO_PUSH_MODE="ask-remote" ;;
+    --push-all) AUTO_PUSH_MODE="all" ;;
+    --no-push) AUTO_PUSH_MODE="none" ;;
+    --no-tui) TUI_ENABLED=0 ;;
+    -v|--version) printf 'gitai %s\n' "$VERSION"; exit 0 ;;
+    -h|--help) show_help; exit 0 ;;
+    *) fail "Unknown option: $1 (try --help)" ;;
+  esac
+  shift
+done
+
+ui_header "GitAI · $(basename "$GIT_ROOT")"
+CURRENT_BRANCH="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+if [ -n "$CURRENT_BRANCH" ]; then
+  ui_note "Branch: $CURRENT_BRANCH"
+else
+  ui_warn "Detached HEAD: committing is allowed, pushing is disabled."
 fi
 
-# Check for staged changes only
-GIT_DIFF=$(git diff --cached --no-ext-diff)
+git status --short
 
-if [ -z "$GIT_DIFF" ]; then
-  echo "No staged changes found. Stage your changes first."
-  exit 1
+if [ -n "$(git status --porcelain)" ]; then
+  STAGED_COUNT="$(git diff --cached --name-only | wc -l | tr -d ' ')"
+  UNSTAGED_COUNT="$(git diff --name-only | wc -l | tr -d ' ')"
+  UNTRACKED_COUNT="$(git ls-files --others --exclude-standard | wc -l | tr -d ' ')"
+  ui_note "Staged: $STAGED_COUNT · Unstaged: $UNSTAGED_COUNT · Untracked: $UNTRACKED_COUNT"
 fi
 
-if [[ $(git diff --name-only) ]]; then
-  echo "⚠️  Warning: You have unstaged changes that will NOT be included in this commit."
+if [ -n "$(git status --porcelain)" ] && [ -z "$(git diff --cached --name-only)" ]; then
+  STAGE_ACTION=$(ui_choose "No staged changes. What should GitAI do?" \
+    "Stage all changes" \
+    "Cancel")
+  case "$STAGE_ACTION" in
+    "Stage all changes") git add -A; ui_success "All changes staged" ;;
+    *) exit 0 ;;
+  esac
+elif [ -n "$(git diff --name-only)$(git ls-files --others --exclude-standard)" ]; then
+  STAGE_ACTION=$(ui_choose "There are changes outside the current index." \
+    "Keep current staged changes" \
+    "Stage all changes" \
+    "Cancel")
+  case "$STAGE_ACTION" in
+    "Stage all changes") git add -A; ui_success "All changes staged" ;;
+    "Cancel") exit 0 ;;
+  esac
 fi
+
+GIT_DIFF="$(git diff --cached --no-ext-diff)"
+[ -n "$GIT_DIFF" ] || fail "No staged changes found."
 
 DIFF_LENGTH=${#GIT_DIFF}
 TRIMMED_DIFF="$GIT_DIFF"
 if [ "$DIFF_LENGTH" -gt "$MAX_DIFF_LENGTH" ]; then
-  echo "⚠️  Diff is too long ($DIFF_LENGTH characters). Trimming to $MAX_DIFF_LENGTH characters."
+  ui_warn "Diff is $DIFF_LENGTH characters; sending the first $MAX_DIFF_LENGTH characters."
   TRIMMED_DIFF="${GIT_DIFF:0:$MAX_DIFF_LENGTH}"
 fi
 
-PROMPT=$(build_chat_prompt "$TRIMMED_DIFF")
-
+PROMPT="$(build_chat_prompt "$TRIMMED_DIFF")"
 IFS=',' read -r -a PROVIDER_CHAIN <<< "$PROVIDER_CHAIN_RAW"
 COMMIT_MESSAGE=""
 LAST_ERROR=""
@@ -241,48 +365,92 @@ SUCCESS_PROVIDER=""
 
 for raw_provider in "${PROVIDER_CHAIN[@]}"; do
   provider="$(trim_value "$raw_provider")"
+  [ -n "$provider" ] || continue
 
-  if [ -z "$provider" ]; then
-    continue
-  fi
-
-  echo "Trying provider: $provider"
-
+  ui_note "Trying provider: $provider"
   if try_provider "$provider" "$PROMPT"; then
     SUCCESS_PROVIDER="$provider"
     break
   fi
-
-  echo "⚠️  Provider '$provider' failed: $LAST_ERROR"
+  ui_warn "Provider '$provider' failed: $LAST_ERROR"
 done
 
-if [ -z "$SUCCESS_PROVIDER" ]; then
-  echo "All configured providers failed. Last error: $LAST_ERROR" >&2
-  exit 2
+[ -n "$SUCCESS_PROVIDER" ] || fail "All configured providers failed. Last error: $LAST_ERROR"
+ui_success "Generated with $SUCCESS_PROVIDER"
+
+TITLE="$(printf '%s\n' "$COMMIT_MESSAGE" | sed -n 's/^[Tt]itle:[[:space:]]*//p' | head -n 1)"
+DESCRIPTION="$(printf '%s\n' "$COMMIT_MESSAGE" | sed -n 's/^[Dd]escription:[[:space:]]*//p' | head -n 1)"
+
+[ -n "$TITLE" ] || fail "Provider response did not contain a Title line."
+[ -n "$DESCRIPTION" ] || DESCRIPTION="AI-generated commit from staged changes."
+
+ui_header "Suggested commit"
+printf '%s\n\n%s\n' "$TITLE" "$DESCRIPTION"
+
+if ! ui_confirm "Create this commit?"; then
+  ui_note "Commit canceled."
+  exit 0
 fi
 
-echo "✅ Provider succeeded: $SUCCESS_PROVIDER"
+git commit -m "$TITLE" -m "$DESCRIPTION"
+ui_success "Commit created"
 
-echo
-echo "==== Suggested Commit Message ===="
-echo "$COMMIT_MESSAGE"
-echo "=================================="
-echo
+if [ -z "$CURRENT_BRANCH" ]; then
+  exit 0
+fi
 
-read -p "Use this commit message? (y/n): " CONFIRM
+REMOTE_NAMES=()
+while IFS= read -r remote; do
+  [ -n "$remote" ] && REMOTE_NAMES+=("$remote")
+done < <(git remote)
 
-if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
-  TITLE=$(echo "$COMMIT_MESSAGE" | grep -i '^Title:' | sed 's/^[Tt]itle:[[:space:]]*//')
-  DESCRIPTION=$(echo "$COMMIT_MESSAGE" | grep -i '^Description:' | sed 's/^[Dd]escription:[[:space:]]*//')
+if [ "${#REMOTE_NAMES[@]}" -eq 0 ]; then
+  ui_note "No Git remotes configured; push skipped."
+  exit 0
+fi
 
-  git commit -m "$TITLE" -m "$DESCRIPTION"
-  echo
-  read -p "Push to remote? (y/n): " PUSH_CONFIRM
-  if [[ "$PUSH_CONFIRM" =~ ^[Yy]$ ]]; then
-    git push
-  else
-    echo "Push skipped."
+push_remote() {
+  local remote="$1"
+  ui_note "Pushing $CURRENT_BRANCH → $remote"
+  git push "$remote" "$CURRENT_BRANCH"
+  ui_success "Pushed to $remote"
+}
+
+push_all_remotes() {
+  local remote
+  for remote in "${REMOTE_NAMES[@]}"; do
+    push_remote "$remote"
+  done
+}
+
+case "$AUTO_PUSH_MODE" in
+  none) exit 0 ;;
+  all) push_all_remotes; exit 0 ;;
+esac
+
+if [ "${#REMOTE_NAMES[@]}" -eq 1 ]; then
+  if [ "$AUTO_PUSH_MODE" = "ask-remote" ] || ui_confirm "Push to ${REMOTE_NAMES[0]}?"; then
+    push_remote "${REMOTE_NAMES[0]}"
   fi
-else
-  echo "Commit canceled."
+  exit 0
 fi
+
+PUSH_OPTIONS=("Skip push" "All remotes")
+for remote in "${REMOTE_NAMES[@]}"; do
+  url="$(git remote get-url --push "$remote" 2>/dev/null || git remote get-url "$remote" 2>/dev/null || true)"
+  if [ -n "$url" ]; then
+    PUSH_OPTIONS+=("$remote  ·  $url")
+  else
+    PUSH_OPTIONS+=("$remote")
+  fi
+done
+
+PUSH_SELECTION="$(ui_choose "Where should this commit be pushed?" "${PUSH_OPTIONS[@]}")"
+case "$PUSH_SELECTION" in
+  "Skip push") exit 0 ;;
+  "All remotes") push_all_remotes ;;
+  *)
+    SELECTED_REMOTE="${PUSH_SELECTION%%  ·  *}"
+    push_remote "$SELECTED_REMOTE"
+    ;;
+esac
