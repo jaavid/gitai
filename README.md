@@ -8,6 +8,7 @@ It stays close to normal Git instead of replacing your workflow. The UI uses [Gu
 
 - Generates Conventional Commit titles and descriptions from staged changes.
 - Supports AvalAI, OpenRouter, Cloudflare Workers AI, and Google AI Studio (Gemini API).
+- Interactive first-run credential setup when no usable API key is found.
 - Supports provider fallback chains.
 - Terminal UI for staging, reviewing, committing, and choosing a push target.
 - Multi-remote aware: push to one remote or all configured remotes.
@@ -15,7 +16,7 @@ It stays close to normal Git instead of replacing your workflow. The UI uses [Gu
 - Falls back to simple text prompts when Gum is unavailable or `GITAI_TUI=0`.
 - Warns about changes outside the index and lets you keep the current staged set or stage everything.
 - Trims very large diffs before sending them to an AI provider.
-- User-wide and repository-specific configuration.
+- User-wide, legacy, and repository-specific configuration.
 
 ## Requirements
 
@@ -51,24 +52,38 @@ cd gitai
 install -m 755 gitai /usr/local/bin/gitai
 ```
 
-## Configuration
+## Configuration and API keys
 
 GitAI reads configuration in this order, with later files overriding earlier values:
 
-1. Legacy `.gitai` next to the executable, if present.
-2. `~/.config/gitai/config` (or `$XDG_CONFIG_HOME/gitai/config`).
-3. `.gitai` in the current repository root.
+1. `.gitai` next to the executable, for compatibility with older installs.
+2. `~/.bin/gitai/.gitai`, the historical GitAI location.
+3. `~/.config/gitai/config` (or `$XDG_CONFIG_HOME/gitai/config`).
+4. `.gitai` in the current repository root.
 
-For API keys, prefer the user-wide config instead of committing credentials into a repository.
+That means an existing file such as:
 
-Create it with:
-
-```bash
-mkdir -p ~/.config/gitai
-$EDITOR ~/.config/gitai/config
+```text
+/Users/javid/.bin/gitai/.gitai
 ```
 
-Example:
+continues to work without migration.
+
+For API keys, prefer the user-wide config instead of committing credentials into a repository. If GitAI cannot find a usable key for any provider in `GITAI_PROVIDER`, it automatically starts an interactive setup wizard. The wizard asks for a provider and API key, masks the key while typing, and saves it to:
+
+```text
+~/.config/gitai/config
+```
+
+The file is created with permission mode `600`.
+
+You can rerun the setup explicitly with:
+
+```bash
+gitai --setup
+```
+
+Example config:
 
 ```bash
 export GITAI_PROVIDER="google,openrouter,cloudflare,avalapis"
@@ -131,12 +146,13 @@ gitai
 
 A typical flow is:
 
-1. GitAI shows the repository, branch, and short status.
-2. If needed, choose whether to stage all changes or keep only the current staged set.
-3. GitAI sends only the staged diff to the configured AI provider chain.
-4. Review the generated Conventional Commit message.
-5. Confirm the commit.
-6. Choose whether and where to push.
+1. GitAI loads existing credentials or opens setup if none are available.
+2. GitAI shows the repository, branch, and short status.
+3. If needed, choose whether to stage all changes or keep only the current staged set.
+4. GitAI sends only the staged diff to the configured AI provider chain.
+5. Review the generated Conventional Commit message.
+6. Confirm the commit.
+7. Choose whether and where to push.
 
 If the repository has multiple remotes, GitAI presents all of them together with an **All remotes** option. The current branch is pushed explicitly to each selected remote.
 
@@ -176,6 +192,7 @@ No Warp-specific configuration is required.
 ```text
 gitai [options]
 
+--setup      Configure an AI provider and API key
 --push       Push after committing; asks for a remote when necessary
 --push-all   Push to every configured remote
 --no-push    Never ask to push
